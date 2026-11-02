@@ -54,4 +54,6 @@ export interface AppConfig {
   devWallet: boolean
   me: string | null
   isAdmin: boolean
+  priceFeed: string
+  vaultMultisig: boolean
 }

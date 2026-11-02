@@ -12,9 +12,10 @@ import { config } from '../config.js'
 import { all, claimTx, now, one, run, unclaimTx, withLock } from '../db.js'
 import {
   HttpError, TF_SELL_NFTOKEN, decodeUri, getAccountNfts, getNftOffer, getValidatedTx, submitAsPlatform,
-  treasuryWallet, vaultWallet,
+  submitAsVault, treasuryWallet, vaultAddress,
 } from '../xrpl.js'
 import { getCustody } from './custody.js'
+import { notify } from './notify.js'
 
 export interface ListingRow {
   id: number
@@ -79,14 +80,18 @@ export async function createShopListing(nftId: string, askDrops: string) {
     const c = getCustody(nftId)
     if (!c || c.purpose !== 'inventory' || c.status !== 'held') throw new HttpError(404, 'Not in shop inventory')
     if (one("SELECT 1 FROM listings WHERE nft_id=? AND status='active'", nftId)) throw new HttpError(409, 'Already listed')
-    const res = await submitAsPlatform(
-      { TransactionType: 'NFTokenCreateOffer', Account: vaultWallet().classicAddress, NFTokenID: nftId, Amount: askDrops, Flags: TF_SELL_NFTOKEN, Destination: treasuryWallet().classicAddress },
-      vaultWallet(),
+    // The co-signer only lets the vault sell an NFT whose pawn loan the treasury funded on-ledger.
+    const loan = one<{ id: number; fund_tx: string }>(
+      "SELECT id, fund_tx FROM loans WHERE nft_id=? AND kind='platform' AND status='defaulted' ORDER BY id DESC LIMIT 1", nftId)
+    if (!loan?.fund_tx) throw new HttpError(409, 'No defaulted pawn loan found for this NFT')
+    const res = await submitAsVault(
+      { TransactionType: 'NFTokenCreateOffer', Account: vaultAddress(), NFTokenID: nftId, Amount: askDrops, Flags: TF_SELL_NFTOKEN, Destination: treasuryWallet().classicAddress },
+      { reason: 'shop_listing', fundTx: loan.fund_tx, loanId: loan.id },
     )
     const r = run(
       `INSERT INTO listings (kind, nft_id, seller, sell_offer, ask_drops, status, uri, created_at, updated_at)
        VALUES ('shop', ?, ?, ?, ?, 'active', ?, ?, ?)`,
-      nftId, vaultWallet().classicAddress, res.meta.offer_id, askDrops, c.uri, now(), now(),
+      nftId, vaultAddress(), res.meta.offer_id, askDrops, c.uri, now(), now(),
     )
     return view(getListing(Number(r.lastInsertRowid))!)
   })
@@ -134,6 +139,7 @@ export async function buy(buyer: string, listingId: number, buyOfferTxHash: stri
       throw e
     }
     run("UPDATE listings SET status='sold', buyer=?, sale_tx=?, updated_at=? WHERE id=?", buyer, res.hash, now(), l.id)
+    if (l.kind === 'p2p') notify(l.seller, 'nft_sold', 'Your NFT sold', `You received ${Number(l.ask_drops) / 1e6} XRP.`, { link: '/market' })
     if (l.kind === 'shop') {
       run("UPDATE custody SET status='released', owner=?, purpose='inventory', updated_at=? WHERE nft_id=?", buyer, now(), l.nft_id)
     }
@@ -149,7 +155,7 @@ export async function cancelListing(address: string, listingId: number, isAdmin:
     if (l.kind === 'shop') {
       if (!isAdmin) throw new HttpError(403, 'Admin only')
       if (await getNftOffer(l.sell_offer)) {
-        await submitAsPlatform({ TransactionType: 'NFTokenCancelOffer', Account: vaultWallet().classicAddress, NFTokenOffers: [l.sell_offer] }, vaultWallet())
+        await submitAsVault({ TransactionType: 'NFTokenCancelOffer', Account: vaultAddress(), NFTokenOffers: [l.sell_offer] }, { reason: 'cancel_offer' })
       }
     } else {
       if (l.seller !== address) throw new HttpError(403, 'Not your listing')

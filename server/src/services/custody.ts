@@ -8,9 +8,10 @@
  */
 import { config } from '../config.js'
 import { all, claimTx, now, one, run, unclaimTx, withLock } from '../db.js'
+import { notify } from './notify.js'
 import {
   HttpError, TF_SELL_NFTOKEN, describeNft, decodeUri, getAccountNfts, getNftOffer, getValidatedTx,
-  submitAsPlatform, vaultWallet,
+  submitAsVault, vaultAddress, type VaultContext,
 } from '../xrpl.js'
 
 export interface CustodyRow {
@@ -23,6 +24,7 @@ export interface CustodyRow {
   deposit_tx: string | null
   release_to: string | null
   release_offer: string | null
+  release_ctx: string | null
   created_at: number
   updated_at: number
 }
@@ -40,7 +42,7 @@ export function listCustody(owner: string) {
 export async function deposit(owner: string, offerTxHash: string): Promise<CustodyRow> {
   const v = await getValidatedTx(offerTxHash)
   const t = v.tx
-  const vault = vaultWallet().classicAddress
+  const vault = vaultAddress()
   if (t.TransactionType !== 'NFTokenCreateOffer') throw new HttpError(400, 'Not an NFTokenCreateOffer transaction')
   if (t.Account !== owner) throw new HttpError(403, 'Offer was not created by your account')
   if (!(Number(t.Flags ?? 0) & TF_SELL_NFTOKEN)) throw new HttpError(400, 'Offer must be a sell offer')
@@ -61,7 +63,7 @@ export async function deposit(owner: string, offerTxHash: string): Promise<Custo
     if (!claimTx(v.hash, 'deposit')) throw new HttpError(409, 'This deposit was already processed')
     try {
       if (!(await getNftOffer(offerId))) throw new HttpError(400, 'Deposit offer no longer exists (cancelled or expired)')
-      await submitAsPlatform({ TransactionType: 'NFTokenAcceptOffer', Account: vault, NFTokenSellOffer: offerId }, vaultWallet())
+      await submitAsVault({ TransactionType: 'NFTokenAcceptOffer', Account: vault, NFTokenSellOffer: offerId }, { reason: 'deposit' })
     } catch (e) {
       unclaimTx(v.hash)
       throw e
@@ -73,30 +75,35 @@ export async function deposit(owner: string, offerTxHash: string): Promise<Custo
       `INSERT INTO custody (nft_id, owner, purpose, status, loan_id, uri, deposit_tx, release_to, release_offer, created_at, updated_at)
        VALUES (?, ?, 'safe', 'held', NULL, ?, ?, NULL, NULL, ?, ?)
        ON CONFLICT(nft_id) DO UPDATE SET owner = excluded.owner, purpose = 'safe', status = 'held', loan_id = NULL,
-         uri = excluded.uri, deposit_tx = excluded.deposit_tx, release_to = NULL, release_offer = NULL, updated_at = excluded.updated_at`,
+         uri = excluded.uri, deposit_tx = excluded.deposit_tx, release_to = NULL, release_offer = NULL, release_ctx = NULL,
+         updated_at = excluded.updated_at`,
       nftId, owner, uri, v.hash, ts, ts,
     )
     return getCustody(nftId)!
   })
 }
 
-/** Create a destination-locked 0 XRP sell offer from the vault to `to`. Caller must hold the NFT lock. */
-export async function releaseTo(nftId: string, to: string): Promise<CustodyRow> {
-  const res = await submitAsPlatform(
+/**
+ * Create a destination-locked 0 XRP sell offer from the vault to `to`. Caller must hold the NFT lock.
+ * `ctx` tells the multisig co-signer why; releasing to anyone other than the depositor needs loan proof.
+ */
+export async function releaseTo(nftId: string, to: string, ctx: VaultContext = { reason: 'release' }): Promise<CustodyRow> {
+  const res = await submitAsVault(
     {
       TransactionType: 'NFTokenCreateOffer',
-      Account: vaultWallet().classicAddress,
+      Account: vaultAddress(),
       NFTokenID: nftId,
       Amount: '0',
       Flags: TF_SELL_NFTOKEN,
       Destination: to,
     },
-    vaultWallet(),
+    ctx,
   )
   run(
-    "UPDATE custody SET status = 'releasing', release_to = ?, release_offer = ?, updated_at = ? WHERE nft_id = ?",
-    to, res.meta.offer_id, now(), nftId,
+    "UPDATE custody SET status = 'releasing', release_to = ?, release_offer = ?, release_ctx = ?, updated_at = ? WHERE nft_id = ?",
+    to, res.meta.offer_id, JSON.stringify(ctx), now(), nftId,
   )
+  if (ctx.reason !== 'release') notify(to, 'nft_ready', 'An NFT is ready to claim', 'Open the Safe and click "Claim to wallet".', { link: '/safe' })
   return getCustody(nftId)!
 }
 
@@ -108,7 +115,8 @@ export async function withdraw(owner: string, nftId: string) {
     if (!c || c.owner !== owner) throw new HttpError(404, 'NFT not found in your Safe')
     if (c.status === 'releasing') return c // offer already waiting for the owner
     if (c.status !== 'held' || c.purpose !== 'safe') throw new HttpError(409, 'NFT is locked as loan collateral and cannot be withdrawn')
-    return releaseTo(nftId, owner)
+    // A forfeited NFT now owned by a lender carries its loan proof for the multisig co-signer.
+    return releaseTo(nftId, owner, c.release_ctx ? JSON.parse(c.release_ctx) : undefined)
   })
 }
 
@@ -116,12 +124,12 @@ export async function withdraw(owner: string, nftId: string) {
 export async function syncRelease(nftId: string): Promise<CustodyRow | undefined> {
   const c = getCustody(nftId)
   if (!c || c.status !== 'releasing') return c
-  const vaultHas = (await getAccountNfts(vaultWallet().classicAddress)).some((n) => n.NFTokenID === c.nft_id)
+  const vaultHas = (await getAccountNfts(vaultAddress())).some((n) => n.NFTokenID === c.nft_id)
   if (!vaultHas) {
     run("UPDATE custody SET status = 'released', owner = COALESCE(release_to, owner), updated_at = ? WHERE nft_id = ?", now(), nftId)
   } else if (c.release_offer && !(await getNftOffer(c.release_offer))) {
     // Offer vanished but NFT still here (e.g. recipient cancelled it); recreate so it can be claimed.
-    await withLock(`nft:${nftId}`, () => releaseTo(nftId, c.release_to!))
+    await withLock(`nft:${nftId}`, () => releaseTo(nftId, c.release_to!, c.release_ctx ? JSON.parse(c.release_ctx) : undefined))
   }
   return getCustody(nftId)
 }
@@ -132,5 +140,4 @@ export async function syncAllReleases() {
   }
 }
 
-export const vaultAddress = () => vaultWallet().classicAddress
-export { config }
+export { config, vaultAddress }

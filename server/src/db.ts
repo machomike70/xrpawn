@@ -102,6 +102,32 @@ CREATE TABLE IF NOT EXISTS listings (
   updated_at INTEGER NOT NULL
 );
 
+-- In-app notifications + reminder bookkeeping
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  address TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  link TEXT,
+  loan_id INTEGER,
+  created_at INTEGER NOT NULL,
+  read_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS notifications_addr ON notifications (address, id);
+CREATE TABLE IF NOT EXISTS reminders_sent (
+  loan_id INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (loan_id, stage)
+);
+-- Xaman user tokens let us push sign requests (e.g. repayments) to a user's phone
+CREATE TABLE IF NOT EXISTS xaman_users (
+  address TEXT PRIMARY KEY,
+  user_token TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 -- Replay protection: a ledger tx can only be credited once
 CREATE TABLE IF NOT EXISTS used_tx (
   hash TEXT PRIMARY KEY,
@@ -109,6 +135,18 @@ CREATE TABLE IF NOT EXISTS used_tx (
   created_at INTEGER NOT NULL
 );
 `)
+
+// Lightweight migrations for databases created by earlier versions
+for (const sql of [
+  'ALTER TABLE custody ADD COLUMN release_ctx TEXT',
+  'ALTER TABLE collections ADD COLUMN live_floor_drops TEXT',
+  'ALTER TABLE collections ADD COLUMN live_listings INTEGER',
+  'ALTER TABLE collections ADD COLUMN live_source TEXT',
+  'ALTER TABLE collections ADD COLUMN live_updated_at INTEGER',
+  'ALTER TABLE collections ADD COLUMN live_error TEXT',
+]) {
+  try { db.exec(sql) } catch { /* column already exists */ }
+}
 
 export const now = () => Math.floor(Date.now() / 1000)
 

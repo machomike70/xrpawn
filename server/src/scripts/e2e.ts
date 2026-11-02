@@ -12,6 +12,13 @@ import 'dotenv/config'
 import { Client, Wallet, convertStringToHex, NFTokenMintFlags, type SubmittableTransaction } from 'xrpl'
 import { sign as kpSign } from 'ripple-keypairs'
 import { HttpsProxyAgent } from 'https-proxy-agent'
+import { randomBytes } from 'node:crypto'
+import { convertToMultisig } from '../multisig.js'
+import { submitWithWallet } from '../xrpl.js'
+
+// E2E_MULTISIG=1 runs every flow against a fresh 2-of-3 multisig vault + the co-signer service.
+const MULTISIG = process.env.E2E_MULTISIG === '1'
+const COSIGNER_PORT = 8798
 
 const PORT = 8799
 const API = `http://localhost:${PORT}/api`
@@ -39,10 +46,8 @@ async function faucet(): Promise<Wallet> {
 }
 
 async function send(w: Wallet, tx: SubmittableTransaction) {
-  const r = await client.submitAndWait(tx, { wallet: w, autofill: true })
-  const meta = r.result.meta as any
-  if (meta.TransactionResult !== 'tesSUCCESS') throw new Error(`${tx.TransactionType} failed: ${meta.TransactionResult}`)
-  return { hash: r.result.hash, meta }
+  const r = await submitWithWallet(client, tx, w) // throws unless tesSUCCESS
+  return { hash: r.hash, meta: r.meta }
 }
 
 const balance = async (a: string) => BigInt((await client.request({ command: 'account_info', account: a })).result.account_data.Balance)
@@ -95,17 +100,47 @@ const [alice, bob, carol] = await Promise.all([faucet(), faucet(), faucet()])
 const admin = Wallet.generate() // only needs to sign in
 console.log({ alice: alice.classicAddress, bob: bob.classicAddress, carol: carol.classicAddress, admin: admin.classicAddress })
 
+const children: ReturnType<typeof spawn>[] = []
+function startProc(label: string, script: string, env: Record<string, string | undefined>) {
+  const p = spawn('npx', ['tsx', script], { env: { ...process.env, ...env } as any, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+  p.stdout!.on('data', (d) => process.stdout.write(`  [${label}] ${d}`))
+  p.stderr!.on('data', (d) => { const s = String(d); if (!s.includes('Warning') && !s.includes('trace-warnings')) process.stdout.write(`  [${label}!] ${s}`) })
+  children.push(p)
+  return p
+}
+// own process groups so we can kill npx + tsx + node together
+const stopServer = () => { for (const c of children) { try { process.kill(-c.pid!, 'SIGTERM') } catch { /* already gone */ } } }
+process.on('exit', stopServer)
+
+let apiEnv: Record<string, string | undefined> = {}
+let multisigVault: Wallet | null = null
+const cosignerToken = randomBytes(16).toString('hex')
+if (MULTISIG) {
+  step('Create a fresh 2-of-3 multisig vault + start the co-signer')
+  multisigVault = await faucet()
+  const apiSigner = Wallet.generate(), cosigner = Wallet.generate(), backup = Wallet.generate()
+  await convertToMultisig(client, multisigVault, [apiSigner.classicAddress, cosigner.classicAddress, backup.classicAddress], 2)
+  const flags = (await client.request({ command: 'account_info', account: multisigVault.classicAddress })).result.account_data.Flags
+  assert((flags & 0x00100000) !== 0, 'vault master key is disabled on-ledger')
+  const treasuryAddr = Wallet.fromSeed(process.env.TREASURY_SEED!).classicAddress
+  startProc('cosigner', 'src/cosigner/index.ts', {
+    COSIGNER_SEED: cosigner.seed, COSIGNER_TOKEN: cosignerToken, COSIGNER_PORT: String(COSIGNER_PORT),
+    VAULT_ADDRESS: multisigVault.classicAddress, TREASURY_ADDRESS: treasuryAddr,
+    COSIGNER_STATE_FILE: join(dbPath, '..', 'cosigner.json'),
+    COSIGNER_MIN_LOAN_AGE_HOURS: '0', // the test fast-forwards due dates instead of waiting days
+  })
+  for (let i = 0; ; i++) {
+    try { await fetch(`http://localhost:${COSIGNER_PORT}/health`); break } catch { if (i > 60) throw new Error('co-signer did not start'); await new Promise((r) => setTimeout(r, 500)) }
+  }
+  apiEnv = {
+    VAULT_SEED: '', VAULT_ADDRESS: multisigVault.classicAddress, VAULT_SIGNER_SEED: apiSigner.seed,
+    COSIGNER_URL: `http://localhost:${COSIGNER_PORT}`, COSIGNER_TOKEN: cosignerToken,
+  }
+}
+
 step('Start API')
 if (await fetch(API + '/config').then(() => true, () => false)) throw new Error(`Port ${PORT} already in use; stop the old server first`)
-const server = spawn('npx', ['tsx', 'src/index.ts'], {
-  env: { ...process.env, PORT: String(PORT), DB_PATH: dbPath, ADMIN_ADDRESSES: admin.classicAddress, JOB_INTERVAL_MS: '3600000', GRACE_HOURS: '0' },
-  stdio: ['ignore', 'pipe', 'pipe'],
-  detached: true, // own process group so we can kill npx + tsx + node together
-})
-const stopServer = () => { try { process.kill(-server.pid!, 'SIGTERM') } catch { /* already gone */ } }
-process.on('exit', stopServer)
-server.stdout.on('data', (d) => process.stdout.write(`  [api] ${d}`))
-server.stderr.on('data', (d) => { const s = String(d); if (!s.includes('Warning') && !s.includes('trace-warnings')) process.stdout.write(`  [api!] ${s}`) })
+startProc('api', 'src/index.ts', { PORT: String(PORT), DB_PATH: dbPath, ADMIN_ADDRESSES: admin.classicAddress, JOB_INTERVAL_MS: '3600000', GRACE_HOURS: '0', ...apiEnv })
 for (let i = 0; ; i++) {
   try { await fetch(API + '/config'); break } catch { if (i > 60) throw new Error('API did not start'); await new Promise((r) => setTimeout(r, 500)) }
 }
@@ -115,6 +150,7 @@ try {
   const cfg = await call('GET', '/config')
   const { vault, treasury } = cfg
   assert(cfg.network === 'testnet', 'API on testnet')
+  if (MULTISIG) assert(vault === multisigVault!.classicAddress, 'API uses the multisig vault')
 
   step('Sign in (challenge signature)')
   const [ta, tb, tc, tadmin] = await Promise.all([login(alice), login(bob), login(carol), login(admin)])
@@ -169,9 +205,12 @@ try {
   await callExpectError('POST', `/loans/${req.id}/offers`, { principalDrops: XRP(12), aprBps: 1800, durationDays: 10 }, ta, 400) // self
   const withOffer = await call('POST', `/loans/${req.id}/offers`, { principalDrops: XRP(12), aprBps: 1800, durationDays: 10 }, tb)
   const offer = withOffer.offers[0]
+  const inbox = async (t: string) => (await call('GET', '/notifications', undefined, t)) as { items: any[]; unread: number }
+  assert((await inbox(ta)).items.some((n) => n.kind === 'offer_received' && n.loan_id === req.id), 'borrower notified of new offer')
   await callExpectError('POST', `/loans/${req.id}/offers/${offer.id}/accept`, {}, tb, 404) // only borrower accepts
   const accepted = await call('POST', `/loans/${req.id}/offers/${offer.id}/accept`, {}, ta)
   assert(accepted.status === 'awaiting_funding' && accepted.lender === bob.classicAddress, 'offer accepted, awaiting Bob')
+  assert((await inbox(tb)).items.some((n) => n.kind === 'offer_accepted'), 'lender notified to fund')
 
   step('Bob funds the loan directly to Alice')
   const fundTx = await send(bob, { TransactionType: 'Payment', Account: bob.classicAddress, Destination: alice.classicAddress, Amount: XRP(12) })
@@ -187,9 +226,27 @@ try {
   const interest = BigInt(active.interest_drops)
   const expected = BigInt(XRP(12)) + interest - (interest * 1000n) / 10000n
   assert((await balance(bob.classicAddress)) - bobBefore === expected, `Bob received ${expected} drops`)
+  assert((await inbox(tb)).items.some((n) => n.kind === 'payout' && n.loan_id === req.id), 'lender notified of payout')
   const aliceNet = aliceBeforeOver - (await balance(alice.classicAddress))
   assert(aliceNet > BigInt(active.amount_due_drops) && aliceNet < BigInt(active.amount_due_drops) + 1000n, 'Alice overpaid 2 XRP and got the excess back (net = amount due + fee)')
   await claimRelease(alice, ta, nft3)
+
+  // ---------------------------------------------------------------- REMINDERS + AUTO-DETECTED REPAYMENT
+  step('Reminders: pawn loan due in 20h -> reminder; then repaid without reporting -> detected from ledger')
+  await depositToSafe(alice, ta, nft1, vault)
+  const rl = await call('POST', '/loans/platform', { nftId: nft1, principalDrops: XRP(2), durationDays: 7 }, ta)
+  db.prepare('UPDATE loans SET due_at = ? WHERE id = ?').run(Math.floor(Date.now() / 1000) + 20 * 3600, rl.id)
+  await call('POST', '/admin/jobs/run', {}, tadmin)
+  const ib = await inbox(ta)
+  assert(ib.items.some((n) => n.kind === 'due_soon' && n.loan_id === rl.id && /24 hours/.test(n.title)), '24h due reminder sent')
+  await call('POST', '/admin/jobs/run', {}, tadmin)
+  assert((await inbox(ta)).items.filter((n) => n.kind === 'due_soon' && n.loan_id === rl.id).length === 1, 'reminder not duplicated')
+  await send(alice, { TransactionType: 'Payment', Account: alice.classicAddress, Destination: treasury, DestinationTag: rl.repay_tag, Amount: rl.amount_due_drops })
+  await call('POST', '/admin/jobs/run', {}, tadmin) // Alice never calls /repay
+  assert((await call('GET', `/loans/${rl.id}`)).status === 'repaid', 'unreported repayment detected on-ledger')
+  await claimRelease(alice, ta, nft1)
+  const readAll = await call('POST', '/notifications/read', {}, ta)
+  assert(readAll.unread === 0, 'mark all notifications read')
 
   // ---------------------------------------------------------------- P2P DEFAULT
   step('P2P default: Bob lends on NFT3 again, Alice never repays -> NFT goes to Bob')
@@ -205,6 +262,22 @@ try {
   await call('POST', '/admin/jobs/run', {}, tadmin)
   assert((await call('GET', `/loans/${r2.id}`)).status === 'defaulted', 'loan defaulted')
   await claimRelease(bob, tb, nft3)
+  assert((await inbox(ta)).items.some((n) => n.kind === 'defaulted' && n.loan_id === r2.id), 'borrower notified of default')
+
+  if (MULTISIG) {
+    step('Attack: compromised API asks the co-signer to give a vaulted NFT to a stranger')
+    await depositToSafe(carol, tc, await mint(carol, 9), vault).then(async (dep: any) => {
+      const tx = await client.autofill({ TransactionType: 'NFTokenCreateOffer', Account: vault, NFTokenID: dep.nft_id, Amount: '0', Flags: 1, Destination: admin.classicAddress }, 2)
+      const r = await fetch(`http://localhost:${COSIGNER_PORT}/sign`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${cosignerToken}` },
+        body: JSON.stringify({ tx, context: { reason: 'default_to_lender', fundTx: fundTx.hash } }),
+      })
+      const j: any = await r.json()
+      assert(r.status === 403, `co-signer refused theft (${j.error})`)
+      const r2 = await fetch(`http://localhost:${COSIGNER_PORT}/sign`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer wrong' }, body: JSON.stringify({ tx }) })
+      assert(r2.status === 401, 'co-signer rejects a wrong token')
+    })
+  }
 
   // ---------------------------------------------------------------- MARKETPLACE
   step('Marketplace: Alice lists NFT1 for 5 XRP, Carol buys (pays 5 + 2% broker fee)')

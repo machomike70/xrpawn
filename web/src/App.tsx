@@ -1,6 +1,7 @@
 import { BrowserRouter, Link, NavLink, Route, Routes } from 'react-router-dom'
 import { SessionProvider, useSession } from './lib/session'
 import { ConnectMenu, Toasts, XamanModal } from './components/ui'
+import Bell from './components/Bell'
 import { pct } from './lib/format'
 import Safe from './pages/Safe'
 import Borrow from './pages/Borrow'
@@ -57,6 +58,7 @@ function Shell() {
           {isAdmin && <NavLink to="/admin">Admin</NavLink>}
         </nav>
         {config && config.network !== 'mainnet' && <span className="net">{config.network}</span>}
+        <Bell />
         <ConnectMenu />
       </header>
       <main>

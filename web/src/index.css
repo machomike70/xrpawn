@@ -129,6 +129,23 @@ dl.kv dd { margin: 0; text-align: right; font-weight: 600; }
 .toast { background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--green); padding: 12px 14px; border-radius: 10px; font-size: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
 .toast.err { border-left-color: var(--red); }
 
+button.icon { padding: 8px; position: relative; }
+.bell { position: relative; }
+.bell .count { position: absolute; top: -2px; right: -2px; background: var(--red); color: #fff; font-size: 10px; font-weight: 800; min-width: 17px; height: 17px; border-radius: 99px; display: grid; place-items: center; padding: 0 4px; }
+.menu.notes { width: min(360px, calc(100vw - 32px)); max-height: 70vh; overflow-y: auto; gap: 2px; }
+.notes-h { padding: 6px 8px; }
+.pad { padding: 8px; margin: 0; }
+.note { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; font-weight: 400; background: transparent; border: 0; border-radius: 8px; padding: 10px; }
+.note:hover:not(:disabled) { background: var(--panel-2); }
+.note.unread { background: rgba(232, 194, 106, 0.07); }
+.note.unread .note-t::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); margin-right: 7px; vertical-align: middle; }
+.note-t { font-weight: 600; font-size: 14px; }
+.note-b { color: var(--muted); font-size: 13px; }
+.note small { color: var(--muted); font-size: 11px; }
+.table-wrap { overflow-x: auto; }
+.pill-ok { color: var(--green); }
+.pill-warn { color: #f0b44c; }
+
 @media (max-width: 860px) {
   .features { grid-template-columns: 1fr 1fr; }
   .two-col { grid-template-columns: 1fr; }

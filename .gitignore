@@ -3,3 +3,5 @@ node_modules
 data
 dist
 *.db
+cosigner.env
+vault-backup-key.txt

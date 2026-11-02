@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { AccountSetAsfFlags, Client, Wallet } from 'xrpl'
 import { HttpsProxyAgent } from 'https-proxy-agent'
+import { submitWithWallet } from '../xrpl.js'
 
 const ENV = '.env'
 const url = process.env.XRPL_WS_URL ?? 'wss://testnet.xrpl-labs.com'
@@ -44,8 +45,8 @@ for (const w of [vault, treasury]) {
 }
 
 // Treasury requires a DestinationTag so every inbound repayment is attributable to a loan.
-const r = await c.submitAndWait({ TransactionType: 'AccountSet', Account: treasury.classicAddress, SetFlag: AccountSetAsfFlags.asfRequireDest }, { wallet: treasury, autofill: true })
-console.log('treasury RequireDest:', (r.result.meta as any).TransactionResult)
+await submitWithWallet(c, { TransactionType: 'AccountSet', Account: treasury.classicAddress, SetFlag: AccountSetAsfFlags.asfRequireDest }, treasury)
+console.log('treasury RequireDest: tesSUCCESS')
 await c.disconnect()
 
 const out = {

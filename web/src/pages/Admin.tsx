@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { api } from '../lib/api'
-import { pct, toDrops, xrp } from '../lib/format'
+import { date, pct, toDrops, xrp } from '../lib/format'
 import { useAction, useSession } from '../lib/session'
 import { useLoad } from '../lib/useLoad'
 import { Addr, Card, Empty, NftImage } from '../components/ui'
 
 export default function Admin() {
-  const { isAdmin } = useSession()
+  const { isAdmin, config } = useSession()
   const overview = useLoad(() => api('/admin/overview'), [], isAdmin)
   const collections = useLoad(() => api<any[]>('/collections'), [])
   const { busy, run } = useAction()
@@ -24,6 +24,7 @@ export default function Admin() {
     await api(`/admin/inventory/${nftId}/list`, { body: { askDrops: toDrops(asks[nftId] ?? '') } })
     overview.reload()
   }, 'Listed in the pawn shop')
+  const refreshPrices = () => run('prices', async () => { await api('/admin/collections/refresh', { method: 'POST' }); collections.reload() }, 'Live prices refreshed')
   const jobs = () => run('jobs', async () => { await api('/admin/jobs/run', { method: 'POST' }); overview.reload() }, 'Jobs ran')
 
   const o = overview.data
@@ -36,24 +37,44 @@ export default function Admin() {
       {o && (
         <div className="stats">
           <div><small>Treasury liquidity</small><b>{xrp(o.treasurySpendableDrops)}</b><Addr a={o.treasury} /></div>
-          <div><small>Vault</small><b>{o.custodyCount.reduce((s: number, r: any) => s + r.n, 0)} NFTs</b><Addr a={o.vault} /></div>
+          <div><small>Vault</small><b>{(() => { const n = o.custodyCount.reduce((s: number, r: any) => s + r.n, 0); return `${n} NFT${n === 1 ? '' : 's'}` })()}</b><Addr a={o.vault} />
+            {config?.vaultMultisig
+              ? <span className="small pill-ok">Multisig 2-of-3 · master key disabled</span>
+              : <span className="small pill-warn">Single key. Run setup:multisig before mainnet</span>}
+          </div>
           {o.loans.filter((r: any) => r.status === 'active').map((r: any) => (
             <div key={r.kind}><small>Active {r.kind} loans</small><b>{r.n}</b><span className="muted small">{xrp(r.principal)} out</span></div>
           ))}
         </div>
       )}
-      <Card title="Approved collections (appraisal table)">
+      <Card
+        title="Approved collections (appraisal table)"
+        actions={config?.priceFeed !== 'none' && <button className="ghost" disabled={!!busy} onClick={refreshPrices}>Refresh live prices</button>}
+      >
+        <p className="muted small">
+          {config?.priceFeed === 'none'
+            ? 'Live prices are off (PRICE_FEED=none). Loans use the floor you enter below.'
+            : `Live prices from "${config?.priceFeed}". Loans use the lower of the live floor and your floor (your floor is the cap; enter 0 to use live only).`}
+        </p>
+        <div className="table-wrap">
         <table className="offers">
-          <thead><tr><th>Name</th><th>Issuer</th><th>Taxon</th><th>Floor</th><th>LTV</th><th /></tr></thead>
+          <thead><tr><th>Name</th><th>Issuer</th><th>Taxon</th><th>Your floor (cap)</th><th>Live floor</th><th>LTV</th><th /></tr></thead>
           <tbody>
             {(collections.data ?? []).map((r) => (
               <tr key={`${r.issuer}${r.taxon}`}>
-                <td>{r.name}</td><td><Addr a={r.issuer} /></td><td>{r.taxon === -1 ? 'any' : r.taxon}</td><td>{xrp(r.floor_drops)}</td><td>{pct(r.ltv_bps)}</td>
+                <td>{r.name}</td><td><Addr a={r.issuer} /></td><td>{r.taxon === -1 ? 'any' : r.taxon}</td>
+                <td>{r.floor_drops === '0' ? 'live only' : xrp(r.floor_drops)}</td>
+                <td className="small">
+                  {r.live_floor_drops ? <>{xrp(r.live_floor_drops)} <span className="muted">· {r.live_listings} listings · {date(r.live_updated_at)}</span></>
+                    : r.live_error ? <span className="pill-warn">{r.live_error}</span> : <span className="muted">–</span>}
+                </td>
+                <td>{pct(r.ltv_bps)}</td>
                 <td><button className="ghost sm" onClick={() => del(r.issuer, r.taxon)}>Remove</button></td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
         <div className="row wrap">
           <label>Name<input value={c.name} onChange={(e) => setC({ ...c, name: e.target.value })} /></label>
           <label>Issuer r-address<input value={c.issuer} onChange={(e) => setC({ ...c, issuer: e.target.value })} /></label>

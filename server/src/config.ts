@@ -23,6 +23,17 @@ export const config = {
 
   /** Account that holds NFTs in custody (Safe deposits + loan collateral + shop inventory). */
   get vaultSeed() { return required('VAULT_SEED') },
+  /**
+   * Multisig vault (recommended for mainnet): set VAULT_ADDRESS + VAULT_SIGNER_SEED + COSIGNER_URL/TOKEN
+   * instead of VAULT_SEED. Run `npm run setup:multisig` to convert the vault.
+   */
+  get vaultMultisig() { return Boolean(process.env.VAULT_ADDRESS && process.env.VAULT_SIGNER_SEED) },
+  vaultAddress: process.env.VAULT_ADDRESS || undefined,
+  vaultSignerSeed: process.env.VAULT_SIGNER_SEED || undefined,
+  vaultQuorum: num('VAULT_QUORUM', 2),
+  cosignerUrl: process.env.COSIGNER_URL ?? 'http://localhost:8788',
+  cosignerToken: process.env.COSIGNER_TOKEN ?? '',
+
   /** Account that funds platform loans, receives repayments and acts as NFT broker. */
   get treasurySeed() { return required('TREASURY_SEED') },
 

@@ -54,6 +54,25 @@ export function createTxPayload(txjson: Record<string, unknown>) {
   return create({ txjson }, 'tx')
 }
 
+/**
+ * Push a sign request straight to a user's Xaman app (no QR needed) using their user token.
+ * Used for repayment reminders: the borrower gets a notification that opens a ready-to-sign repayment.
+ */
+export async function pushTxToUser(userToken: string, txjson: Record<string, unknown>, instruction: string) {
+  const created = await client().payload.create(
+    {
+      txjson: txjson as any,
+      user_token: userToken,
+      options: { submit: true, expire: 24 * 60, force_network: NETWORK_NAME[config.network] },
+      custom_meta: { instruction },
+    },
+    true,
+  )
+  if (!created) throw new Error('Xaman did not create the payload')
+  run('INSERT INTO xaman_payloads (uuid, purpose, created_at) VALUES (?, ?, ?)', created.uuid, 'tx', now())
+  return created.pushed
+}
+
 export async function payloadStatus(uuid: string) {
   const row = one<{ purpose: string; consumed: number }>('SELECT purpose, consumed FROM xaman_payloads WHERE uuid = ?', uuid)
   if (!row) throw new HttpError(404, 'Unknown payload')
@@ -68,6 +87,15 @@ export async function payloadStatus(uuid: string) {
     account: p.response.account,
     txid: p.response.txid,
     dispatchedResult: p.response.dispatched_result,
+  }
+
+  // Xaman issues a user token once the user signs for this app; it lets us push sign requests later.
+  const userToken = p.application?.issued_user_token
+  if (p.meta.signed && userToken && p.response.account) {
+    run(
+      'INSERT INTO xaman_users (address, user_token, updated_at) VALUES (?, ?, ?) ON CONFLICT(address) DO UPDATE SET user_token = excluded.user_token, updated_at = excluded.updated_at',
+      p.response.account, userToken, now(),
+    )
   }
 
   if (row.purpose === 'signin' && p.meta.signed && p.response.hex) {

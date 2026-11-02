@@ -58,6 +58,12 @@ function Appraisal({ nftId, onDone }: { nftId: string; onDone: () => void }) {
             <dl className="kv">
               <dt>Collection</dt><dd>{a.collection}</dd>
               <dt>Appraised floor</dt><dd>{xrp(a.floorDrops)}</dd>
+              <dt>Price basis</dt>
+              <dd className="small">
+                {a.floorBasis === 'admin' ? 'Platform appraisal'
+                  : a.floorBasis === 'live' ? `Live market (${a.liveListings} listings)`
+                  : `Platform cap (market is ${xrp(a.liveFloorDrops)})`}
+              </dd>
               <dt>Max loan ({pct(a.ltvBps)} LTV)</dt><dd className="gold">{xrp(a.maxLoanDrops)}</dd>
               <dt>Rate</dt><dd>{pct(a.aprBps)} APR, fixed for the term</dd>
             </dl>

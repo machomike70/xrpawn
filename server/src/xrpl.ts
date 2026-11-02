@@ -1,4 +1,4 @@
-import { Client, Wallet, parseNFTokenID, convertHexToString, type SubmittableTransaction } from 'xrpl'
+import { Client, Wallet, parseNFTokenID, convertHexToString, multisign, hashes, type SubmittableTransaction } from 'xrpl'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { config, RIPPLE_EPOCH_OFFSET } from './config.js'
 
@@ -22,9 +22,60 @@ export async function getClient(): Promise<Client> {
 }
 
 let _vault: Wallet | null = null
+let _vaultSigner: Wallet | null = null
 let _treasury: Wallet | null = null
-export const vaultWallet = () => (_vault ??= Wallet.fromSeed(config.vaultSeed))
 export const treasuryWallet = () => (_treasury ??= Wallet.fromSeed(config.treasurySeed))
+
+/** Single-key vault (dev/testnet). In multisig mode there is no vault master key on this server. */
+export const vaultWallet = () => (_vault ??= Wallet.fromSeed(config.vaultSeed))
+export const vaultAddress = () => (config.vaultMultisig ? config.vaultAddress! : vaultWallet().classicAddress)
+const vaultSignerWallet = () => (_vaultSigner ??= Wallet.fromSeed(config.vaultSignerSeed!))
+
+/** Why the vault is signing; the co-signer verifies these claims against the ledger itself. */
+export interface VaultContext {
+  reason: 'deposit' | 'release' | 'default_to_lender' | 'shop_listing' | 'cancel_offer'
+  /** For default_to_lender / shop_listing: the on-ledger payment that funded the loan. */
+  fundTx?: string
+  loanId?: number
+}
+
+/**
+ * Sign and submit a transaction from the vault.
+ * Single-key mode signs locally. Multisig mode signs with this server's signer key, asks the independent
+ * co-signer service for the second signature (it applies its own policy checks), combines and submits.
+ */
+export async function submitAsVault(tx: SubmittableTransaction, context: VaultContext): Promise<ValidatedTx> {
+  if (!config.vaultMultisig) return submitAsPlatform(tx, vaultWallet())
+  const c = await getClient()
+  return withExpiryRetry(async () => {
+    const prepared = await c.autofill({ ...tx, Account: vaultAddress() } as SubmittableTransaction, config.vaultQuorum)
+    const mine = vaultSignerWallet().sign(prepared, true)
+    const r = await fetch(`${config.cosignerUrl}/sign`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${config.cosignerToken}` },
+      body: JSON.stringify({ tx: prepared, context }),
+    }).catch((e) => { throw new LedgerError('cosigner_unreachable', `Vault co-signer unreachable: ${e.message}`) })
+    const j: any = await r.json().catch(() => ({}))
+    if (!r.ok || !j.tx_blob) throw new LedgerError('cosigner_refused', `Vault co-signer refused: ${j.error ?? r.status}`)
+    const blob = multisign([mine.tx_blob, j.tx_blob])
+    return submitBlob(c, blob, hashes.hashSignedTx(blob), prepared.LastLedgerSequence!)
+  })
+}
+
+/**
+ * Re-sign and resubmit ONLY when the previous attempt definitely expired (its LastLedgerSequence passed and the
+ * tx is in no validated ledger), which makes resubmitting safe. Unknown outcomes are never retried.
+ */
+async function withExpiryRetry(attempt: () => Promise<ValidatedTx>, tries = 3): Promise<ValidatedTx> {
+  for (let i = 1; ; i++) {
+    try {
+      return await attempt()
+    } catch (e) {
+      if (!(e instanceof LedgerError && e.code === 'expired') || i >= tries) throw e
+      console.warn(`transaction expired without being included; retrying (${i}/${tries - 1})`)
+    }
+  }
+}
 
 export class LedgerError extends Error {
   constructor(public code: string, message?: string) {
@@ -41,37 +92,54 @@ export interface ValidatedTx {
 
 /** Sign with a platform wallet, submit, wait for validation, throw unless tesSUCCESS. */
 export async function submitAsPlatform(tx: SubmittableTransaction, wallet: Wallet): Promise<ValidatedTx> {
-  const c = await getClient()
-  const prepared = await c.autofill(tx)
-  const signed = wallet.sign(prepared)
+  return submitWithWallet(await getClient(), tx, wallet)
+}
+
+/** Sign with `wallet` using any client, with the same don't-give-up-early validation wait + safe expiry retry. */
+export async function submitWithWallet(c: Client, tx: SubmittableTransaction, wallet: Wallet): Promise<ValidatedTx> {
+  return withExpiryRetry(async () => {
+    const prepared = await c.autofill(tx)
+    const signed = wallet.sign(prepared)
+    return submitBlob(c, signed.tx_blob, signed.hash, prepared.LastLedgerSequence!)
+  })
+}
+
+async function submitBlob(c: Client, blob: string, hash: string, lastLedger: number): Promise<ValidatedTx> {
   let result: any
   try {
-    result = (await c.submitAndWait(signed.tx_blob)).result
+    result = (await c.submitAndWait(blob)).result
   } catch (e: any) {
     // submitAndWait can give up while the tx is still being validated (slow/lagging node).
     // Never assume failure for a signed tx: look it up by hash until LastLedgerSequence has passed.
-    result = await waitForFinalTx(c, signed.hash, prepared.LastLedgerSequence!)
-    if (!result) throw new LedgerError('timeout', `Transaction ${signed.hash} was not validated: ${e?.message}`)
+    const final = await waitForFinalTx(c, hash, lastLedger)
+    if (final === 'expired') throw new LedgerError('expired', `Transaction ${hash} expired without being included`)
+    if (!final) throw new LedgerError('timeout', `Transaction ${hash} outcome unknown: ${e?.message}`)
+    result = final
   }
   const meta = result.meta as any
   const code = typeof meta === 'object' ? meta.TransactionResult : 'unknown'
   if (code !== 'tesSUCCESS') throw new LedgerError(code)
   return {
-    hash: signed.hash,
+    hash,
     tx: result.tx_json ?? result,
     meta,
     closeTimeUnix: result.close_time_iso ? Date.parse(result.close_time_iso) / 1000 : Date.now() / 1000,
   }
 }
 
-async function waitForFinalTx(c: Client, hash: string, lastLedger: number) {
-  for (let i = 0; i < 30; i++) {
+/** Returns the validated tx, 'expired' if it can no longer be included, or null if still unknown. */
+async function waitForFinalTx(c: Client, hash: string, lastLedger: number): Promise<any | 'expired' | null> {
+  const lookup = async () => {
     try {
       const r: any = (await c.request({ command: 'tx', transaction: hash } as any)).result
-      if (r.validated) return r
-    } catch { /* not found yet */ }
-    const cur = await c.getLedgerIndex().catch(() => 0)
-    if (cur > lastLedger + 2) return null
+      return r.validated ? r : null
+    } catch { return null }
+  }
+  for (let i = 0; i < 45; i++) {
+    const found = await lookup()
+    if (found) return found
+    const validated = await c.getLedgerIndex().catch(() => 0) // latest validated ledger
+    if (validated > lastLedger + 1) return (await lookup()) ?? 'expired'
     await new Promise((r) => setTimeout(r, 2000))
   }
   return null

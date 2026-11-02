@@ -19,6 +19,11 @@ import {
 } from '../xrpl.js'
 import { appraise } from './appraisal.js'
 import { getCustody, releaseTo } from './custody.js'
+import { notify, once, pushRepayment } from './notify.js'
+import { xrpToDrops, dropsToXrp } from 'xrpl'
+
+const X = (drops: bigint | string) => `${dropsToXrp(String(drops))} XRP`
+void xrpToDrops
 
 export interface LoanRow {
   id: number
@@ -198,6 +203,8 @@ export function makeOffer(lender: string, loanId: number, principalDrops: string
     `INSERT INTO loan_offers (loan_id, lender, principal_drops, apr_bps, duration_days, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)`,
     loanId, lender, principal.toString(), apr, days, now(),
   )
+  notify(l.borrower, 'offer_received', `New loan offer on request #${loanId}`,
+    `A lender offers ${X(principal)} at ${apr / 100}% APR for ${days} days.`, { link: '/borrow', loanId })
   return loanView(getLoan(loanId)!)
 }
 
@@ -226,6 +233,8 @@ export async function acceptOffer(borrower: string, loanId: number, offerId: num
         offerId, now(), now(), loanId,
       )
     })
+    notify(o.lender, 'offer_accepted', `Your offer on #${loanId} was accepted`,
+      `Send ${X(o.principal_drops)} to the borrower within ${config.fundingWindowHours}h to start the loan.`, { link: '/lend', loanId })
     return loanView(getLoan(loanId)!)
   })
 }
@@ -247,6 +256,8 @@ async function activateWithFunding(l: LoanRow, hash: string) {
   run("UPDATE loans SET status='active', fund_tx=?, funded_at=?, due_at=?, updated_at=? WHERE id=?",
     hash, ts, ts + l.duration_days * 86400, ts, l.id)
   run("UPDATE loan_offers SET status='expired' WHERE loan_id=? AND status='open'", l.id)
+  notify(l.borrower, 'loan_funded', `Loan #${l.id} is funded`,
+    `You received ${X(l.principal_drops)}. Repay ${X(BigInt(l.principal_drops) + BigInt(l.interest_drops))} within ${l.duration_days} days.`, { link: '/borrow', loanId: l.id })
 }
 
 /** Lender reports the payment they sent to the borrower. */
@@ -299,6 +310,7 @@ export async function reportRepayment(loanId: number, txHash: string) {
     if (l.status !== 'active' || d < owed) {
       const why = l.status !== 'active' ? `Loan is ${l.status}` : `Delivered ${d} drops but ${owed} are owed`
       const refund = await refundPayment(t.Account, d, `loan ${l.id}: ${why}`).catch((e) => { console.error('refund failed', v.hash, e); return null })
+      notify(t.Account, 'refund', `Payment for loan #${l.id} refunded`, `${why}. ${refund ? `${X(d)} was sent back to you.` : 'Refund pending; contact support.'}`, { link: '/borrow', loanId: l.id })
       throw new HttpError(400, `${why}. ${refund ? `Your ${d} drops were refunded (tx ${refund}).` : 'Refund pending; contact support.'}`)
     }
     if (d > owed) {
@@ -309,6 +321,7 @@ export async function reportRepayment(loanId: number, txHash: string) {
     run("UPDATE custody SET purpose='safe', loan_id=NULL, updated_at=? WHERE nft_id=?", now(), l.nft_id)
     // Return NFT straight to the borrower's wallet.
     await withLock(`nft:${l.nft_id}`, () => releaseTo(l.nft_id, l.borrower))
+    notify(l.borrower, 'repaid', `Loan #${l.id} repaid`, 'Your NFT is ready to claim in the Safe.', { link: '/safe', loanId: l.id })
     if (l.kind === 'p2p') await payoutLender(l.id).catch((e) => console.error('payout failed, will retry', l.id, e))
     return loanView(getLoan(l.id)!)
   })
@@ -336,6 +349,7 @@ async function payoutLender(loanId: number) {
     treasuryWallet(),
   )
   run('UPDATE loans SET payout_tx=?, payout_drops=?, updated_at=? WHERE id=?', r.hash, amount.toString(), now(), l.id)
+  notify(l.lender, 'payout', `Loan #${l.id} repaid`, `You were paid ${X(amount)} (principal + interest after the platform fee).`, { link: '/lend', loanId: l.id })
 }
 
 // ---------------------------------------------------------------- background job
@@ -353,6 +367,8 @@ export async function runLoanJobs() {
       if (ts > (cur.accepted_at ?? 0) + config.fundingWindowHours * 3600) {
         run("UPDATE loan_offers SET status='expired' WHERE id=?", cur.accepted_offer_id)
         run("UPDATE loans SET status='requested', lender=NULL, accepted_offer_id=NULL, accepted_at=NULL, updated_at=? WHERE id=?", ts, cur.id)
+        notify(cur.borrower, 'funding_expired', `Lender didn't fund #${cur.id}`, 'Your request is open for offers again.', { link: '/borrow', loanId: cur.id })
+        notify(cur.lender, 'funding_expired', `Offer on #${cur.id} expired`, 'You did not fund in time, so the request was reopened.', { link: '/lend', loanId: cur.id })
       }
     }).catch((e) => console.error('funding job', l.id, e))
   }
@@ -365,16 +381,68 @@ export async function runLoanJobs() {
       if (cur.status !== 'active') return
       run("UPDATE loans SET status='defaulted', defaulted_at=?, updated_at=? WHERE id=?", ts, ts, cur.id)
       if (cur.kind === 'p2p') {
-        run("UPDATE custody SET owner=?, purpose='safe', loan_id=NULL, updated_at=? WHERE nft_id=?", cur.lender, ts, cur.nft_id)
-        await withLock(`nft:${cur.nft_id}`, () => releaseTo(cur.nft_id, cur.lender!))
+        // Keep the loan proof with the NFT so any later release to the lender carries it (multisig co-signer needs it).
+        const ctx = { reason: 'default_to_lender' as const, fundTx: cur.fund_tx!, loanId: cur.id }
+        run("UPDATE custody SET owner=?, purpose='safe', loan_id=NULL, release_ctx=?, updated_at=? WHERE nft_id=?", cur.lender, JSON.stringify(ctx), ts, cur.nft_id)
+        notify(cur.lender, 'collateral_claimed', `Loan #${cur.id} defaulted`, 'The collateral NFT is now yours. Claim it in the Safe.', { link: '/safe', loanId: cur.id })
+        await withLock(`nft:${cur.nft_id}`, () => releaseTo(cur.nft_id, cur.lender!, ctx))
+          .catch((e) => console.error('default release failed; lender can withdraw from the Safe later', cur.id, e?.message))
       } else {
         run("UPDATE custody SET owner=?, purpose='inventory', loan_id=NULL, updated_at=? WHERE nft_id=?", treasuryWallet().classicAddress, ts, cur.nft_id)
       }
+      notify(cur.borrower, 'defaulted', `Loan #${cur.id} defaulted`, 'The grace period ended without repayment, so the collateral NFT was forfeited.', { link: '/borrow', loanId: cur.id })
     }).catch((e) => console.error('default job', l.id, e))
   }
 
   // 3) Retry failed lender payouts
   for (const l of all<LoanRow>("SELECT * FROM loans WHERE kind='p2p' AND status='repaid' AND payout_tx IS NULL")) {
     await withLock(`loan:${l.id}`, () => payoutLender(l.id)).catch((e) => console.error('payout job', l.id, e))
+  }
+
+  // 4) Apply repayments that borrowers sent but never reported (any wallet, incl. Xaman push)
+  await scanRepayments().catch((e) => console.error('repayment scan', e?.message))
+
+  // 5) Due-date reminders
+  await sendReminders(now())
+}
+
+/** Look at recent treasury payments carrying a loan's repayment tag and apply them. */
+export async function scanRepayments() {
+  const c = await getClient()
+  const r: any = await c.request({ command: 'account_tx', account: treasuryWallet().classicAddress, limit: 200, forward: false } as any)
+  for (const e of r.result.transactions) {
+    const t = e.tx_json ?? e.tx
+    if (!e.validated || t?.TransactionType !== 'Payment' || t.Destination !== treasuryWallet().classicAddress) continue
+    const tag = Number(t.DestinationTag)
+    if (!(tag > REPAY_TAG_OFFSET)) continue
+    const hash = String(e.hash ?? t.hash).toUpperCase()
+    if (one('SELECT 1 FROM used_tx WHERE hash = ?', hash)) continue
+    const loanId = tag - REPAY_TAG_OFFSET
+    if (!getLoan(loanId)) continue
+    await reportRepayment(loanId, hash).catch(() => { /* refund/other outcome handled + logged inside */ })
+  }
+}
+
+/** Reminders at 72h and 24h before due, and once overdue (during the grace period). */
+export async function sendReminders(ts: number) {
+  for (const l of all<LoanRow>("SELECT * FROM loans WHERE status='active' AND due_at IS NOT NULL")) {
+    const left = l.due_at! - ts
+    const owed = BigInt(l.principal_drops) + BigInt(l.interest_drops)
+    const repayTx = { TransactionType: 'Payment', Destination: treasuryWallet().classicAddress, DestinationTag: repayTag(l.id), Amount: owed.toString() }
+    let stage: string | null = null
+    let title = '', body = ''
+    if (left < 0) {
+      stage = 'overdue'
+      const graceEnd = l.due_at! + config.graceHours * 3600
+      title = `Loan #${l.id} is overdue`
+      body = `Repay ${X(owed)} within ${Math.max(0, Math.round((graceEnd - ts) / 3600))}h or the collateral NFT is forfeited.`
+    } else if (left <= 24 * 3600) {
+      stage = 'due_24h'; title = `Loan #${l.id} is due within 24 hours`; body = `Repay ${X(owed)} to keep your NFT.`
+    } else if (left <= 72 * 3600) {
+      stage = 'due_72h'; title = `Loan #${l.id} is due in 3 days`; body = `Repay ${X(owed)} before the due date.`
+    }
+    if (!stage || !once(l.id, stage)) continue
+    notify(l.borrower, stage === 'overdue' ? 'overdue' : 'due_soon', title, body, { link: '/borrow', loanId: l.id })
+    if (stage !== 'due_72h') await pushRepayment(l.borrower, repayTx, `${title}. ${body}`)
   }
 }

@@ -49,6 +49,42 @@ Restart `npm run dev`. An **Admin** tab appears. Approve a collection there (iss
    ```
 4. Restart. The Xaman option in *Connect wallet* is now enabled. Never share these keys or commit `.env`.
 
+### Secure the vault with multisig (do this before real money)
+Out of the box the vault is one key in `server\.env`. Turn it into a **2-of-3 multisig** account with its master key disabled:
+```powershell
+cd server
+npm run setup:multisig
+```
+This creates three signer keys. Any two of them can sign:
+
+| Key | Lives in | Used for |
+|---|---|---|
+| API signer | `server\.env` | everyday signing by the API |
+| Co-signer | `server\cosigner.env` | the separate **co-signer service** (`npm run cosigner`), ideally on another machine or cloud account |
+| Backup | `server\vault-backup-key.txt` | recovery only. **Copy it to paper or a hardware wallet, store it offline, then delete the file** |
+
+The co-signer adds its signature only after checking each vault transaction against the ledger itself, never the API's database. So **a hacked API server alone cannot steal NFTs.** It allows:
+- accepting free deposits;
+- returning an NFT to the address that deposited it;
+- giving an NFT to someone else only with an on-ledger loan payment from that address to the depositor, at least `COSIGNER_MIN_LOAN_AGE_HOURS` old (default 96h = shortest term + grace period);
+- listing forfeited pawn NFTs in the shop, only through the broker and only at or above a minimum price (`COSIGNER_SHOP_MIN_BPS` of the loan, default 50%).
+
+It refuses payments, account changes and buying NFTs from the vault, caps fees, and rate-limits transfers per day. Its log shows every `SIGNED` and `REFUSED` decision.
+Remaining risk: a hacked API plus a colluding *borrower* could get collateral returned early (it goes back to the depositor, which the co-signer allows). Watch the co-signer log and alert on unusual returns.
+
+### Live NFT prices
+Set `PRICE_FEED` in `server\.env` to:
+- `clio`: free; reads public sell offers directly from the XRP Ledger. Needs `CLIO_URL`, a Clio server (Ripple runs public ones on mainnet).
+- `bithomp`: needs `BITHOMP_API_KEY` (a paid plan for on-sale lists). Built from Bithomp's public docs; check the first refresh on the Admin page once you have a key.
+- `http`: your own endpoint (`PRICE_FEED_URL`) returning `{"floorDrops": "...", "listings": N}`.
+
+The live floor is the **cheapest public listing**, and only for collections with at least `PRICE_FEED_MIN_LISTINGS` listings. Your admin floor is a **hard ceiling**: live prices can lower a loan quote but never raise it above your number. Enter `0` as the floor to use live prices only. Prices refresh every 15 minutes, or click *Refresh live prices* on the Admin page.
+
+### Notifications & reminders
+- **Every user** gets an in-app inbox (the bell icon): new loan offers, "your offer was accepted, please fund", loan funded, reminders 3 days and 1 day before the due date, overdue/grace-period warnings, repaid and payout sent, defaults, NFT sold, NFT ready to claim, and refunds.
+- **Xaman users** also get a push on their phone 1 day before the due date and when overdue. The push opens a ready-to-sign repayment, so repaying is one tap. (Xaman lets an app push sign requests once the user has signed in with Xaman.)
+- **Repayments are detected automatically** from the ledger, even if the borrower paid from another wallet and never clicked anything.
+
 ---
 
 ## How it works on the XRPL
@@ -73,7 +109,10 @@ server/   Node + Express + xrpl.js API, SQLite (node:sqlite), background jobs
   src/services/loans.ts      pawn + P2P loans, repayment, refunds, defaults
   src/services/market.ts     brokered marketplace + shop listings
   src/services/appraisal.ts  collection floors & LTV
-  src/services/xaman.ts      Xaman sign-in + sign requests
+  src/services/xaman.ts      Xaman sign-in, sign requests, push
+  src/services/pricefeed.ts  live NFT floor prices (clio / bithomp / http)
+  src/services/notify.ts     in-app notifications + reminders
+  src/cosigner/              vault co-signer service + its policy (separate process)
   src/scripts/e2e.ts         full end-to-end test on XRPL testnet
 web/      React + Vite front end (Borrow, Lend, Market, Safe, Admin)
 ```
@@ -81,9 +120,11 @@ web/      React + Vite front end (Borrow, Lend, Market, Safe, Admin)
 ### Tests
 ```powershell
 cd server
-npm run e2e
+npm run test:unit                 # co-signer policy + price feed (fast, offline)
+npm run e2e                       # every flow on the real XRPL testnet
+$env:E2E_MULTISIG=1; npm run e2e  # the same, with a fresh 2-of-3 multisig vault + co-signer
 ```
-This creates fresh testnet wallets and runs every flow against the real testnet: Safe deposit and withdraw, a pawn loan (including LTV limits, collateral lock, short-payment refund, replay protection), a P2P loan (offer, accept, fund, repay, lender payout, overpayment refund), a P2P default where the lender gets the NFT, an unreported funding payment that the server finds on-ledger, a marketplace sale with the broker fee, and a pawn default sold through the shop.
+This creates fresh testnet wallets and runs every flow against the real testnet: Safe deposit and withdraw, a pawn loan (including LTV limits, collateral lock, short-payment refund, replay protection), a P2P loan (offer, accept, fund, repay, lender payout, overpayment refund), a P2P default where the lender gets the NFT, an unreported funding payment that the server finds on-ledger, a marketplace sale with the broker fee, and a pawn default sold through the shop. It also covers notifications, due-date reminders (sent once, never duplicated), and an unreported repayment detected from the ledger. Multisig mode also checks that the vault master key is disabled on-ledger and that the co-signer refuses to hand a vaulted NFT to a stranger.
 
 ### Configuration (`server/.env`)
 See `server/.env.example`. Key terms (bps = basis points, 100 = 1%):
@@ -96,7 +137,7 @@ Interest is a **fixed fee for the term**: principal × APR × days / 365. Repayi
 ## Before going to mainnet (checklist)
 
 **Keys & accounts**
-- [ ] Vault: set up a `SignerListSet` multisig (e.g. 2-of-3 on separate devices/HSM) and **disable the master key**. The server then needs a co-signing flow, or should hold only a regular key with limited funds.
+- [ ] Vault: `npm run setup:multisig`, run the co-signer on a **separate** machine/account, move the backup key offline.
 - [ ] Treasury: keep only working liquidity hot; refill from cold storage.
 - [ ] Seeds in a secrets manager (not a `.env` file on disk).
 - [ ] `XRPL_NETWORK=mainnet`, `XRPL_WS_URL=wss://xrplcluster.com` (dev wallet and faucet routes switch off automatically on mainnet).
@@ -108,7 +149,7 @@ Interest is a **fixed fee for the term**: principal × APR × days / 365. Repayi
 - [ ] Tax treatment of loans, defaults and sales.
 
 **Product**
-- [ ] Live price feed for appraisals (plug into `services/appraisal.ts`; keys `PRICE_FEED_URL` / `PRICE_FEED_API_KEY` / `BITHOMP_API_KEY` are reserved in `.env`).
-- [ ] Notifications (due-date reminders, offer received).
+- [ ] Turn on a live price feed (`PRICE_FEED`) and check the Admin page shows sensible floors.
+- [ ] Add your Xaman keys so borrowers get one-tap repayment pushes.
 - [ ] Use Postgres instead of SQLite if you run more than one server instance.
 - [ ] Watch for XRPL's native lending protocol (XLS-65/66): once enabled on mainnet, parts of the loan logic could move fully on-ledger.

@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { config } from './config.js'
 import { api } from './routes.js'
-import { HttpError, LedgerError, getClient, treasuryWallet, vaultWallet } from './xrpl.js'
+import { HttpError, LedgerError, getClient, treasuryWallet, vaultAddress } from './xrpl.js'
 import { startJobs } from './jobs.js'
 
 const app = express()
@@ -28,7 +28,7 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 await getClient()
 console.log(`XRPawn API on http://localhost:${config.port}  network=${config.network}`)
-console.log(`  vault    ${vaultWallet().classicAddress}`)
+console.log(`  vault    ${vaultAddress()}`)
 console.log(`  treasury ${treasuryWallet().classicAddress}`)
 app.listen(config.port)
 startJobs()

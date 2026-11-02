@@ -6,7 +6,10 @@
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "setup:testnet": "tsx src/scripts/setup-testnet.ts",
-    "e2e": "tsx src/scripts/e2e.ts"
+    "e2e": "tsx src/scripts/e2e.ts",
+    "setup:multisig": "tsx src/scripts/setup-multisig.ts",
+    "cosigner": "tsx --env-file=cosigner.env src/cosigner/index.ts",
+    "test:unit": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.6",
