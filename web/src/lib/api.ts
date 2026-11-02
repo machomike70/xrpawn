@@ -56,4 +56,5 @@ export interface AppConfig {
   isAdmin: boolean
   priceFeed: string
   vaultMultisig: boolean
+  textrp: boolean
 }

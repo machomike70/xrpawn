@@ -143,6 +143,8 @@ button.icon { padding: 8px; position: relative; }
 .note-b { color: var(--muted); font-size: 13px; }
 .note small { color: var(--muted); font-size: 11px; }
 .table-wrap { overflow-x: auto; }
+.textrp-toggle { flex-direction: row; align-items: center; gap: 8px; padding: 8px 10px; margin: 0 2px 4px; border-radius: 8px; background: var(--panel-2); color: var(--text); font-size: 13px; cursor: pointer; }
+.textrp-toggle input { width: auto; accent-color: var(--gold); }
 .pill-ok { color: var(--green); }
 .pill-warn { color: #f0b44c; }
 

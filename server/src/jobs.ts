@@ -4,6 +4,7 @@ import { runLoanJobs } from './services/loans.js'
 import { syncAllReleases } from './services/custody.js'
 import { syncListings } from './services/market.js'
 import { maybeRefreshFloors } from './services/appraisal.js'
+import { deliverTextrp } from './services/textrp.js'
 
 let running = false
 
@@ -15,6 +16,7 @@ export async function runJobs() {
     await syncAllReleases()
     await syncListings()
     await maybeRefreshFloors().catch((e) => console.error('price feed', e))
+    await deliverTextrp().catch((e) => console.error('textrp', e))
     run('DELETE FROM sessions WHERE expires_at < ?', now())
     run('DELETE FROM challenges WHERE created_at < ?', now() - 3600)
   } finally {

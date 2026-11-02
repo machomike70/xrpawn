@@ -12,6 +12,7 @@ import * as market from './services/market.js'
 import * as xaman from './services/xaman.js'
 import { feedConfig } from './services/pricefeed.js'
 import * as notifications from './services/notify.js'
+import * as textrp from './services/textrp.js'
 
 export const api = Router()
 
@@ -40,6 +41,7 @@ api.get('/config', (req, res) => {
     marketFeeBps: config.marketFeeBps,
     priceFeed: feedConfig().provider,
     vaultMultisig: config.vaultMultisig,
+    textrp: textrp.textrpEnabled(),
     graceHours: config.graceHours,
     fundingWindowHours: config.fundingWindowHours,
     xaman: xaman.xamanEnabled(),
@@ -149,6 +151,18 @@ api.post('/notifications/read', requireAuth, (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : undefined
   notifications.markRead(req.address!, ids)
   res.json(notifications.listNotifications(req.address!))
+})
+
+api.get('/prefs', requireAuth, (req, res) => res.json(textrp.getPrefs(req.address!)))
+api.post('/prefs', requireAuth, (req, res) => {
+  if (req.body?.textrp === true && !textrp.textrpEnabled()) throw new HttpError(501, 'TextRP is not configured on this server')
+  res.json(textrp.setPrefs(req.address!, { textrp: typeof req.body?.textrp === 'boolean' ? req.body.textrp : undefined }))
+})
+api.post('/prefs/textrp/test', requireAuth, async (req, res) => {
+  if (!textrp.textrpEnabled()) throw new HttpError(501, 'TextRP is not configured on this server')
+  await textrp.sendTextrp(req.address!, 'XRPawn alerts are on', 'You will get loan reminders and alerts here.', '/borrow')
+    .catch((e) => { throw new HttpError(502, `TextRP: ${e.message}. Do you have a TextRP account for this wallet?`) })
+  res.json({ ok: true })
 })
 
 // ---------------------------------------------------------------- admin

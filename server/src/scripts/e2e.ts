@@ -50,7 +50,11 @@ async function send(w: Wallet, tx: SubmittableTransaction) {
   return { hash: r.hash, meta: r.meta }
 }
 
-const balance = async (a: string) => BigInt((await client.request({ command: 'account_info', account: a })).result.account_data.Balance)
+// Read from the latest *validated* ledger, after giving in-flight transactions a moment to land.
+const balance = async (a: string) => {
+  await new Promise((r) => setTimeout(r, 1500))
+  return BigInt((await client.request({ command: 'account_info', account: a, ledger_index: 'validated' })).result.account_data.Balance)
+}
 const ownsNft = async (a: string, id: string) => ((await client.request({ command: 'account_nfts', account: a })).result.account_nfts as any[]).some((n) => n.NFTokenID === id)
 
 async function call(method: string, path: string, body?: unknown, token?: string) {
@@ -96,7 +100,9 @@ async function claimRelease(w: Wallet, token: string, nftId: string) {
 
 // ------------------------------------------------------------------------------------------
 step('Create test wallets')
-const [alice, bob, carol] = await Promise.all([faucet(), faucet(), faucet()])
+const [alice, bob, carol, testTreasury] = await Promise.all([faucet(), faucet(), faucet(), faucet()])
+// Each run gets its own treasury so it can't collide with a dev server (or another run) sharing the same one.
+await submitWithWallet(client, { TransactionType: 'AccountSet', Account: testTreasury.classicAddress, SetFlag: 1 /* asfRequireDest */ }, testTreasury)
 const admin = Wallet.generate() // only needs to sign in
 console.log({ alice: alice.classicAddress, bob: bob.classicAddress, carol: carol.classicAddress, admin: admin.classicAddress })
 
@@ -122,7 +128,7 @@ if (MULTISIG) {
   await convertToMultisig(client, multisigVault, [apiSigner.classicAddress, cosigner.classicAddress, backup.classicAddress], 2)
   const flags = (await client.request({ command: 'account_info', account: multisigVault.classicAddress })).result.account_data.Flags
   assert((flags & 0x00100000) !== 0, 'vault master key is disabled on-ledger')
-  const treasuryAddr = Wallet.fromSeed(process.env.TREASURY_SEED!).classicAddress
+  const treasuryAddr = testTreasury.classicAddress
   startProc('cosigner', 'src/cosigner/index.ts', {
     COSIGNER_SEED: cosigner.seed, COSIGNER_TOKEN: cosignerToken, COSIGNER_PORT: String(COSIGNER_PORT),
     VAULT_ADDRESS: multisigVault.classicAddress, TREASURY_ADDRESS: treasuryAddr,
@@ -140,7 +146,7 @@ if (MULTISIG) {
 
 step('Start API')
 if (await fetch(API + '/config').then(() => true, () => false)) throw new Error(`Port ${PORT} already in use; stop the old server first`)
-startProc('api', 'src/index.ts', { PORT: String(PORT), DB_PATH: dbPath, ADMIN_ADDRESSES: admin.classicAddress, JOB_INTERVAL_MS: '3600000', GRACE_HOURS: '0', ...apiEnv })
+startProc('api', 'src/index.ts', { PORT: String(PORT), DB_PATH: dbPath, TREASURY_SEED: testTreasury.seed, ADMIN_ADDRESSES: admin.classicAddress, JOB_INTERVAL_MS: '3600000', GRACE_HOURS: '0', ...apiEnv })
 for (let i = 0; ; i++) {
   try { await fetch(API + '/config'); break } catch { if (i > 60) throw new Error('API did not start'); await new Promise((r) => setTimeout(r, 500)) }
 }
@@ -228,7 +234,8 @@ try {
   assert((await balance(bob.classicAddress)) - bobBefore === expected, `Bob received ${expected} drops`)
   assert((await inbox(tb)).items.some((n) => n.kind === 'payout' && n.loan_id === req.id), 'lender notified of payout')
   const aliceNet = aliceBeforeOver - (await balance(alice.classicAddress))
-  assert(aliceNet > BigInt(active.amount_due_drops) && aliceNet < BigInt(active.amount_due_drops) + 1000n, 'Alice overpaid 2 XRP and got the excess back (net = amount due + fee)')
+  assert(aliceNet > BigInt(active.amount_due_drops) && aliceNet < BigInt(active.amount_due_drops) + 1000n,
+    `Alice overpaid 2 XRP and got the excess back (net paid ${aliceNet} vs due ${active.amount_due_drops})`)
   await claimRelease(alice, ta, nft3)
 
   // ---------------------------------------------------------------- REMINDERS + AUTO-DETECTED REPAYMENT
@@ -241,6 +248,13 @@ try {
   assert(ib.items.some((n) => n.kind === 'due_soon' && n.loan_id === rl.id && /24 hours/.test(n.title)), '24h due reminder sent')
   await call('POST', '/admin/jobs/run', {}, tadmin)
   assert((await inbox(ta)).items.filter((n) => n.kind === 'due_soon' && n.loan_id === rl.id).length === 1, 'reminder not duplicated')
+  // An old payment with the same tag (made before this loan existed) must not count as repayment
+  db.prepare('UPDATE loans SET funded_at = ? WHERE id = ?').run(Math.floor(Date.now() / 1000) + 3600, rl.id)
+  const early = await send(alice, { TransactionType: 'Payment', Account: alice.classicAddress, Destination: treasury, DestinationTag: rl.repay_tag, Amount: rl.amount_due_drops })
+  await callExpectError('POST', `/loans/${rl.id}/repay`, { txHash: early.hash }, undefined, 400)
+  await call('POST', '/admin/jobs/run', {}, tadmin)
+  assert((await call('GET', `/loans/${rl.id}`)).status === 'active', 'payment older than the loan is not applied by the scanner')
+  db.prepare('UPDATE loans SET funded_at = ? WHERE id = ?').run(Math.floor(Date.now() / 1000) - 60, rl.id)
   await send(alice, { TransactionType: 'Payment', Account: alice.classicAddress, Destination: treasury, DestinationTag: rl.repay_tag, Amount: rl.amount_due_drops })
   await call('POST', '/admin/jobs/run', {}, tadmin) // Alice never calls /repay
   assert((await call('GET', `/loans/${rl.id}`)).status === 'repaid', 'unreported repayment detected on-ledger')
@@ -307,8 +321,11 @@ try {
   assert(await ownsNft(carol.classicAddress, nft2), 'Carol owns NFT2 from the shop')
 
   console.log('\nALL E2E CHECKS PASSED')
+} catch (e) {
+  console.error('\nE2E FAILED:', e)
+  process.exitCode = 1
 } finally {
   stopServer()
-  await client.disconnect()
+  await client.disconnect().catch(() => {})
   process.exit(process.exitCode ?? 0)
 }

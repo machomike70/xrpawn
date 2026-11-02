@@ -302,6 +302,9 @@ export async function reportRepayment(loanId: number, txHash: string) {
     if (t.TransactionType !== 'Payment') throw new HttpError(400, 'Not a Payment')
     if (t.Destination !== treasuryWallet().classicAddress) throw new HttpError(400, 'Repayment must be sent to the treasury')
     if (Number(t.DestinationTag) !== repayTag(l.id)) throw new HttpError(400, `DestinationTag must be ${repayTag(l.id)}`)
+    // A payment made before this loan existed can't repay it (protects against old payments that reuse a tag,
+    // e.g. after a database restore while the treasury account stays the same).
+    if (v.closeTimeUnix < (l.funded_at ?? l.created_at) - 60) throw new HttpError(400, 'This payment was made before the loan was funded')
     const d = deliveredDrops(v.meta)
     if (d === null) throw new HttpError(400, 'Repayments must be in XRP. Contact support to recover token payments.')
     if (!claimTx(v.hash, `repay:${l.id}`)) throw new HttpError(409, 'This payment was already used')
@@ -418,7 +421,11 @@ export async function scanRepayments() {
     const hash = String(e.hash ?? t.hash).toUpperCase()
     if (one('SELECT 1 FROM used_tx WHERE hash = ?', hash)) continue
     const loanId = tag - REPAY_TAG_OFFSET
-    if (!getLoan(loanId)) continue
+    const loan = getLoan(loanId)
+    if (!loan) continue
+    // Non-active loans still go through reportRepayment, which refunds payments to closed loans.
+    const closeTime = e.close_time_iso ? Date.parse(e.close_time_iso) / 1000 : 0
+    if (closeTime < (loan.funded_at ?? loan.created_at) - 60) continue // older than the loan: not a repayment of it
     await reportRepayment(loanId, hash).catch(() => { /* refund/other outcome handled + logged inside */ })
   }
 }

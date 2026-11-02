@@ -13,7 +13,8 @@ const ago = (t: number) => {
 }
 
 export default function Bell() {
-  const { address } = useSession()
+  const { address, config, toast } = useSession()
+  const [textrpOn, setTextrpOn] = useState(false)
   const nav = useNavigate()
   const [data, setData] = useState<{ items: Note[]; unread: number }>({ items: [], unread: 0 })
   const [open, setOpen] = useState(false)
@@ -22,6 +23,21 @@ export default function Bell() {
   const load = useCallback(() => {
     if (address) api('/notifications').then(setData).catch(() => {})
   }, [address])
+
+  useEffect(() => {
+    if (address && config?.textrp) api('/prefs').then((p) => setTextrpOn(p.textrp)).catch(() => {})
+  }, [address, config?.textrp])
+
+  const toggleTextrp = async (on: boolean) => {
+    try {
+      if (on) await api('/prefs/textrp/test', { method: 'POST' }) // proves the wallet has a TextRP account
+      const p = await api('/prefs', { body: { textrp: on } })
+      setTextrpOn(p.textrp)
+      toast(on ? 'TextRP alerts on. Check TextRP for a test message.' : 'TextRP alerts off')
+    } catch (e: any) {
+      toast(e.message, 'err')
+    }
+  }
 
   useEffect(() => {
     load()
@@ -57,6 +73,12 @@ export default function Bell() {
             <strong>Notifications</strong>
             {data.unread > 0 && <button className="ghost sm" onClick={async () => setData(await api('/notifications/read', { body: {} }))}>Mark all read</button>}
           </div>
+          {config?.textrp && (
+            <label className="textrp-toggle">
+              <input type="checkbox" checked={textrpOn} onChange={(e) => toggleTextrp(e.target.checked)} />
+              <span>Also send alerts to my wallet on <b>TextRP</b></span>
+            </label>
+          )}
           {data.items.length === 0 ? <p className="muted small pad">Nothing yet.</p> : data.items.map((n) => (
             <button key={n.id} className={`note ${n.read_at ? '' : 'unread'}`} onClick={() => click(n)}>
               <span className="note-t">{n.title}</span>

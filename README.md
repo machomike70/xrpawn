@@ -84,6 +84,7 @@ The live floor is the **cheapest public listing**, and only for collections with
 - **Every user** gets an in-app inbox (the bell icon): new loan offers, "your offer was accepted, please fund", loan funded, reminders 3 days and 1 day before the due date, overdue/grace-period warnings, repaid and payout sent, defaults, NFT sold, NFT ready to claim, and refunds.
 - **Xaman users** also get a push on their phone 1 day before the due date and when overdue. The push opens a ready-to-sign repayment, so repaying is one tap. (Xaman lets an app push sign requests once the user has signed in with Xaman.)
 - **Repayments are detected automatically** from the ledger, even if the borrower paid from another wallet and never clicked anything.
+- **TextRP (optional):** TextRP is a chat network where everyone's ID is their XRPL wallet, so XRPawn can DM alerts straight to a user's wallet. Create a bot account on TextRP, put its access token in `server\.env` as `TEXTRP_ACCESS_TOKEN` (plus `TEXTRP_HOMESERVER` / `TEXTRP_SERVER_NAME` if they differ from `synapse.textrp.io`), and restart. Users switch it on under the bell icon ("Also send alerts to my wallet on TextRP"). Turning it on sends a test message first, so they know it works. Nobody is messaged without opting in. Wallets without a TextRP account are skipped, not retried forever.
 
 ---
 
@@ -112,6 +113,7 @@ server/   Node + Express + xrpl.js API, SQLite (node:sqlite), background jobs
   src/services/xaman.ts      Xaman sign-in, sign requests, push
   src/services/pricefeed.ts  live NFT floor prices (clio / bithomp / http)
   src/services/notify.ts     in-app notifications + reminders
+  src/services/textrp.ts     TextRP (Matrix) delivery of notifications to wallets
   src/cosigner/              vault co-signer service + its policy (separate process)
   src/scripts/e2e.ts         full end-to-end test on XRPL testnet
 web/      React + Vite front end (Borrow, Lend, Market, Safe, Admin)
@@ -120,11 +122,14 @@ web/      React + Vite front end (Borrow, Lend, Market, Safe, Admin)
 ### Tests
 ```powershell
 cd server
-npm run test:unit                 # co-signer policy + price feed (fast, offline)
+npm run test:unit                 # co-signer policy, price feed, TextRP (fast, offline)
 npm run e2e                       # every flow on the real XRPL testnet
 $env:E2E_MULTISIG=1; npm run e2e  # the same, with a fresh 2-of-3 multisig vault + co-signer
 ```
 This creates fresh testnet wallets and runs every flow against the real testnet: Safe deposit and withdraw, a pawn loan (including LTV limits, collateral lock, short-payment refund, replay protection), a P2P loan (offer, accept, fund, repay, lender payout, overpayment refund), a P2P default where the lender gets the NFT, an unreported funding payment that the server finds on-ledger, a marketplace sale with the broker fee, and a pawn default sold through the shop. It also covers notifications, due-date reminders (sent once, never duplicated), and an unreported repayment detected from the ledger. Multisig mode also checks that the vault master key is disabled on-ledger and that the co-signer refuses to hand a vaulted NFT to a stranger.
+
+### One server per treasury
+Run exactly **one** XRPawn API (one database) per treasury/vault pair. Loans are matched to repayments by destination tag, so two servers with different databases sharing a treasury would apply or refund each other's payments. For staging or testing, use separate testnet accounts (`npm run e2e` creates its own treasury every run).
 
 ### Configuration (`server/.env`)
 See `server/.env.example`. Key terms (bps = basis points, 100 = 1%):
@@ -151,5 +156,6 @@ Interest is a **fixed fee for the term**: principal × APR × days / 365. Repayi
 **Product**
 - [ ] Turn on a live price feed (`PRICE_FEED`) and check the Admin page shows sensible floors.
 - [ ] Add your Xaman keys so borrowers get one-tap repayment pushes.
+- [ ] Optionally add a TextRP bot token so users can get alerts in TextRP.
 - [ ] Use Postgres instead of SQLite if you run more than one server instance.
 - [ ] Watch for XRPL's native lending protocol (XLS-65/66): once enabled on mainnet, parts of the loan logic could move fully on-ledger.

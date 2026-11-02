@@ -128,6 +128,18 @@ CREATE TABLE IF NOT EXISTS xaman_users (
   updated_at INTEGER NOT NULL
 );
 
+-- TextRP (Matrix) delivery: per-user opt-in + the DM room with each wallet
+CREATE TABLE IF NOT EXISTS user_prefs (
+  address TEXT PRIMARY KEY,
+  textrp INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS textrp_rooms (
+  address TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 -- Replay protection: a ledger tx can only be credited once
 CREATE TABLE IF NOT EXISTS used_tx (
   hash TEXT PRIMARY KEY,
@@ -144,6 +156,7 @@ for (const sql of [
   'ALTER TABLE collections ADD COLUMN live_source TEXT',
   'ALTER TABLE collections ADD COLUMN live_updated_at INTEGER',
   'ALTER TABLE collections ADD COLUMN live_error TEXT',
+  'ALTER TABLE notifications ADD COLUMN textrp_status TEXT',
 ]) {
   try { db.exec(sql) } catch { /* column already exists */ }
 }
